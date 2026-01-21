@@ -9,6 +9,8 @@ This script includes:
 4. Bayesian model and guide definitions
 5. Training with SVI
 6. Results visualization and analysis
+
+! pip install torch pyro-ppl
 """
 
 import numpy as np

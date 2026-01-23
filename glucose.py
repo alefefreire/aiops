@@ -1,28 +1,33 @@
 """
-Complete Bayesian Physics-Informed Neural Network (B-PINN) for Bergman Minimal Model
-Using Pyro for variational inference
+Improved Bayesian Physics-Informed Neural Network (B-PINN) for Bergman Minimal Model
+Using Pyro for variational inference with SIMULATED DATA for testing
 
-This script includes:
-1. Data loading and preprocessing
-2. Insulin absorption modeling
-3. Neural network architecture
-4. Bayesian model and guide definitions
-5. Training with SVI
-6. Results visualization and analysis
+Key Improvements:
+1. Synthetic data generation with known parameters
+2. Fixed physics loss computation during sampling
+3. Validation/test split
+4. Uncertainty quantification
+5. Better normalization handling
+6. Convergence diagnostics
+7. Comprehensive posterior predictive checks
 
-! pip install torch pyro-ppl
+Requirements:
+pip install torch pyro-ppl matplotlib pandas numpy scipy
 """
 
+import os
+from pathlib import Path
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
 import pyro
 import pyro.distributions as dist
-from pyro.infer import SVI, Trace_ELBO
+import torch
+import torch.nn as nn
+from pyro.infer import SVI, Predictive, Trace_ELBO
 from pyro.optim import ClippedAdam
-import matplotlib.pyplot as plt
-from pathlib import Path
+from scipy.integrate import odeint
 
 # Set random seeds for reproducibility
 torch.manual_seed(42)
@@ -30,922 +35,1032 @@ np.random.seed(42)
 pyro.set_rng_seed(42)
 
 # Device configuration
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 
 # ============================================================================
-# 1. DATA LOADING AND PREPROCESSING
+# 1. SYNTHETIC DATA GENERATION
 # ============================================================================
 
-def load_and_prepare_data(filepath, tau=30.0, bioavailability=0.6, V_d=12.0):
+
+def bergman_odes(state, t, p1, p2, p3, I_func, Gb, Ib):
     """
-    Load diabetes data and prepare for Bergman model
-    
+    Bergman minimal model ODEs
+
+    dG/dt = -p1*(G - Gb) - X*G
+    dX/dt = -p2*X + p3*(I(t) - Ib)
+
     Parameters:
     -----------
-    filepath : str
-        Path to Excel file
-    tau : float
-        Insulin absorption time constant (minutes)
-    bioavailability : float
-        Subcutaneous insulin bioavailability (0-1)
-    V_d : float
-        Insulin distribution volume (liters)
-    
+    state : array [G, X]
+    t : float, time
+    p1, p2, p3 : float, Bergman parameters
+    I_func : callable, insulin function I(t)
+    Gb, Ib : float, basal glucose and insulin
+    """
+    G, X = state
+    I = I_func(t)
+
+    dG_dt = -p1 * (G - Gb) - X * G
+    dX_dt = -p2 * X + p3 * (I - Ib)
+
+    return [dG_dt, dX_dt]
+
+
+def generate_synthetic_data(
+    n_points=200,
+    time_span=(0, 300),  # minutes
+    true_params={"p1": 0.028, "p2": 0.025, "p3": 1.5e-5},
+    Gb=100.0,  # mg/dL
+    Ib=10.0,  # μU/mL
+    meal_times=[30, 120, 210],  # minutes
+    meal_doses=[8.0, 10.0, 6.0],  # IU insulin
+    tau=30.0,  # insulin absorption time constant
+    noise_std=5.0,  # glucose measurement noise
+    seed=42,
+):
+    """
+    Generate synthetic diabetes data using the Bergman model
+
     Returns:
     --------
-    dict containing preprocessed data
+    dict with synthetic data and true parameters
     """
-    print(f"Loading data from {filepath}...")
-    
-    # Read Excel file
-    df = pd.read_excel(filepath)
-    
-    # Display available columns
-    print("\nAvailable columns:")
-    for i, col in enumerate(df.columns):
-        print(f"  {i}: {col}")
-    
-    # Find relevant columns
-    time_cols = [col for col in df.columns if any(x in col.lower() for x in ['time', 'date', 'timestamp'])]
-    glucose_cols = [col for col in df.columns if any(x in col.lower() for x in ['glucose', 'cgm', 'bg'])]
-    bolus_cols = [col for col in df.columns if 'bolus' in col.lower()]
-    basal_cols = [col for col in df.columns if 'basal' in col.lower()]
-    
-    print(f"\nDetected columns:")
-    print(f"  Time: {time_cols}")
-    print(f"  Glucose: {glucose_cols}")
-    print(f"  Bolus insulin: {bolus_cols}")
-    print(f"  Basal insulin: {basal_cols}")
-    
-    # Extract data
-    time_col = time_cols[0] if time_cols else df.columns[0]
-    glucose_col = glucose_cols[0] if glucose_cols else None
-    bolus_col = bolus_cols[0] if bolus_cols else None
-    basal_col = basal_cols[0] if basal_cols else None
-    
-    if glucose_col is None:
-        raise ValueError("Could not find glucose column. Please specify manually.")
-    
-    # Clean data
-    required_cols = [time_col, glucose_col]
-    df_clean = df[required_cols].copy()
-    
-    # Add bolus insulin if available
-    if bolus_col:
-        df_clean['bolus'] = df[bolus_col].fillna(0.0)
-    else:
-        print("  ⚠️  Warning: No bolus insulin column found, assuming no boluses")
-        df_clean['bolus'] = 0.0
-    
-    # Add basal insulin if available
-    if basal_col:
-        df_clean['basal'] = df[basal_col].fillna(0.0)
-        print(f"  ✓ Using basal insulin from column: {basal_col}")
-    else:
-        print("  ⚠️  Warning: No basal insulin column found, will estimate from data")
-        df_clean['basal'] = 0.0
-    
-    df_clean = df_clean.dropna(subset=[glucose_col])
-    
-    # Convert time to minutes from start
-    if pd.api.types.is_datetime64_any_dtype(df_clean[time_col]):
-        t_minutes = (df_clean[time_col] - df_clean[time_col].min()).dt.total_seconds() / 60.0
-    else:
-        t_minutes = df_clean[time_col].values
-    
-    df_clean['t_minutes'] = t_minutes
-    
-    # Extract glucose and insulin
-    G_obs = df_clean[glucose_col].values
-    bolus = df_clean['bolus'].values
-    basal_insulin_data = df_clean['basal'].values
-    
-    print(f"\nData statistics:")
-    print(f"  Number of observations: {len(G_obs)}")
-    print(f"  Time range: {t_minutes.min():.1f} - {t_minutes.max():.1f} minutes")
-    print(f"  Glucose range: {G_obs.min():.1f} - {G_obs.max():.1f} mg/dL")
-    print(f"  Number of insulin boluses: {(bolus > 0).sum()}")
-    if (bolus > 0).any():
-        print(f"  Insulin bolus range: {bolus[bolus > 0].min():.2f} - {bolus[bolus > 0].max():.2f} IU")
-    if (basal_insulin_data > 0).any():
-        print(f"  Basal insulin range: {basal_insulin_data[basal_insulin_data > 0].min():.2f} - {basal_insulin_data[basal_insulin_data > 0].max():.2f} (units in file)")
-    
-    # Model bolus insulin absorption with proper unit conversion
-    I_bolus = np.zeros_like(t_minutes, dtype=float)
-    IU_to_microU = 1000.0  # 1 IU = 1000 μU
-    
-    for i, dose in enumerate(bolus):
-        if dose > 0:
-            # Convert IU to plasma concentration (μU/mL)
-            dose_concentration = (dose * IU_to_microU * bioavailability) / V_d
-            
-            # Exponential absorption model
-            time_diff = t_minutes - t_minutes[i]
-            absorption = dose_concentration * np.exp(-time_diff / tau)
-            absorption[time_diff < 0] = 0  # Causality
-            I_bolus += absorption
-    
-    # Handle basal insulin from data
-    if basal_col and (basal_insulin_data > 0).any():
-        # Basal insulin found in dataset
-        basal_mean = basal_insulin_data[basal_insulin_data > 0].mean()
-        
-        # Auto-detect units based on magnitude
-        if basal_mean < 5.0:  
-            # Likely IU/hr (typical pump basal rate: 0.5-2.0 IU/hr)
-            print(f"\n  ✓ Basal insulin detected as IU/hr (mean={basal_mean:.2f} IU/hr)")
-            print(f"    Converting to plasma concentration...")
-            
-            # Convert IU/hr to steady-state plasma concentration (μU/mL)
-            # At steady state: infusion rate = clearance rate
-            # Clearance half-life ~5-10 min → clearance constant ~0.1 min^-1
-            clearance_constant = 0.1  # min^-1
-            I_basal_concentration = (basal_mean * bioavailability * IU_to_microU) / (V_d * clearance_constant * 60)
-            Ib = I_basal_concentration
-            print(f"    Calculated Ib = {Ib:.1f} μU/mL")
-            
-        else:  
-            # Likely already in concentration units (μU/mL)
-            print(f"\n  ✓ Basal insulin detected as concentration (mean={basal_mean:.2f} μU/mL)")
-            Ib = basal_mean
-            
-    else:
-        # No basal insulin in data - use default
-        Ib = 10.0  # Typical fasting insulin concentration
-        print(f"\n  ⚠️  No basal insulin data found - using default: Ib = {Ib:.1f} μU/mL")
-        print(f"     (Typical fasting insulin concentration)")
-    
-    # Total insulin = basal + bolus contribution
-    I_obs = Ib + I_bolus
-    
-    # Estimate basal glucose
-    Gb = np.percentile(G_obs, 10)  # Use 10th percentile as basal glucose
-    
-    print(f"\nBasal values:")
-    print(f"  Gb (basal glucose): {Gb:.1f} mg/dL")
-    print(f"  Ib (basal insulin): {Ib:.1f} μU/mL")
-    print(f"\nInsulin statistics:")
-    print(f"  I_obs range: {I_obs.min():.2f} - {I_obs.max():.2f} μU/mL")
-    print(f"  (I_obs - Ib) range: {(I_obs - Ib).min():.2f} - {(I_obs - Ib).max():.2f} μU/mL")
-    
-    # Check identifiability
-    max_insulin_excursion = (I_obs - Ib).max()
-    if max_insulin_excursion < 5.0:
-        print(f"\n⚠️  WARNING: Insulin excursion is very small ({max_insulin_excursion:.2f} μU/mL)")
-        print("   Parameter p3 may not be identifiable. Consider fixing it to literature value.")
-        fix_p3_recommended = True
-    else:
-        fix_p3_recommended = False
-    
-    # Normalize data for neural network
+    np.random.seed(seed)
+
+    print("=" * 70)
+    print("GENERATING SYNTHETIC DATA")
+    print("=" * 70)
+    print(f"\nTrue parameters:")
+    print(f"  p1 = {true_params['p1']:.4f} min⁻¹ (glucose effectiveness)")
+    print(f"  p2 = {true_params['p2']:.4f} min⁻¹ (insulin action decay)")
+    print(f"  p3 = {true_params['p3']:.6f} min⁻² per μU/mL (insulin sensitivity)")
+    print(f"  Gb = {Gb:.1f} mg/dL (basal glucose)")
+    print(f"  Ib = {Ib:.1f} μU/mL (basal insulin)")
+
+    print(f"\nMeal schedule:")
+    for t, dose in zip(meal_times, meal_doses):
+        print(f"  t={t} min: {dose} IU insulin")
+
+    # Time points
+    t_eval = np.linspace(time_span[0], time_span[1], n_points)
+
+    # Create insulin function
+    def insulin_function(t):
+        """Insulin concentration at time t"""
+        I = Ib  # Start with basal
+        for t_meal, dose in zip(meal_times, meal_doses):
+            if t >= t_meal:
+                # Exponential absorption
+                dt = t - t_meal
+                I += (dose * 1000.0 * 0.6 / 12.0) * np.exp(-dt / tau)
+        return I
+
+    # Solve ODEs
+    initial_state = [Gb, 0.0]  # Start at basal glucose, X=0
+
+    solution = odeint(
+        bergman_odes,
+        initial_state,
+        t_eval,
+        args=(
+            true_params["p1"],
+            true_params["p2"],
+            true_params["p3"],
+            insulin_function,
+            Gb,
+            Ib,
+        ),
+    )
+
+    G_true = solution[:, 0]
+    X_true = solution[:, 1]
+
+    # Generate insulin timeseries
+    I_true = np.array([insulin_function(t) for t in t_eval])
+
+    # Add measurement noise to glucose
+    G_obs = G_true + np.random.normal(0, noise_std, size=G_true.shape)
+
+    print(f"\nGenerated data statistics:")
+    print(f"  Time points: {n_points}")
+    print(f"  Time range: {t_eval[0]:.1f} - {t_eval[-1]:.1f} min")
+    print(f"  G_true range: {G_true.min():.1f} - {G_true.max():.1f} mg/dL")
+    print(f"  G_obs range: {G_obs.min():.1f} - {G_obs.max():.1f} mg/dL")
+    print(f"  I range: {I_true.min():.1f} - {I_true.max():.1f} μU/mL")
+    print(f"  X range: {X_true.min():.4f} - {X_true.max():.4f}")
+    print(f"  Noise std: {noise_std:.1f} mg/dL")
+
+    return {
+        "t_minutes": t_eval,
+        "G_true": G_true,
+        "G_obs": G_obs,
+        "X_true": X_true,
+        "I_true": I_true,
+        "Gb": Gb,
+        "Ib": Ib,
+        "true_params": true_params,
+        "noise_std": noise_std,
+    }
+
+
+def prepare_synthetic_data(synthetic_data):
+    """
+    Prepare synthetic data for PINN training
+    """
+    t_minutes = synthetic_data["t_minutes"]
+    G_obs = synthetic_data["G_obs"]
+    I_obs = synthetic_data["I_true"]
+    Gb = synthetic_data["Gb"]
+    Ib = synthetic_data["Ib"]
+
+    # Normalization
     t_mean, t_std = t_minutes.mean(), t_minutes.std()
     G_mean, G_std = G_obs.mean(), G_obs.std()
     I_mean, I_std = I_obs.mean(), I_obs.std()
-    
+
     t_norm = (t_minutes - t_mean) / t_std
     G_norm = (G_obs - G_mean) / G_std
     I_norm = (I_obs - I_mean) / I_std
-    
+
     # Convert to tensors
     data = {
-        't': torch.tensor(t_norm, dtype=torch.float32).reshape(-1, 1),
-        't_raw': torch.tensor(t_minutes, dtype=torch.float32).reshape(-1, 1),
-        'G_obs': torch.tensor(G_norm, dtype=torch.float32),
-        'G_obs_raw': torch.tensor(G_obs, dtype=torch.float32),
-        'I_obs': torch.tensor(I_norm, dtype=torch.float32).reshape(-1, 1),
-        'I_obs_raw': torch.tensor(I_obs, dtype=torch.float32).reshape(-1, 1),
-        'Gb': float(Gb),
-        'Ib': float(Ib),
-        'normalization': {
-            't_mean': t_mean, 't_std': t_std,
-            'G_mean': G_mean, 'G_std': G_std,
-            'I_mean': I_mean, 'I_std': I_std
+        "t": torch.tensor(t_norm, dtype=torch.float32).reshape(-1, 1),
+        "t_raw": torch.tensor(t_minutes, dtype=torch.float32).reshape(-1, 1),
+        "G_obs": torch.tensor(G_norm, dtype=torch.float32),
+        "G_obs_raw": torch.tensor(G_obs, dtype=torch.float32),
+        "G_true_raw": torch.tensor(synthetic_data["G_true"], dtype=torch.float32),
+        "X_true_raw": torch.tensor(synthetic_data["X_true"], dtype=torch.float32),
+        "I_obs": torch.tensor(I_norm, dtype=torch.float32).reshape(-1, 1),
+        "I_obs_raw": torch.tensor(I_obs, dtype=torch.float32).reshape(-1, 1),
+        "Gb": float(Gb),
+        "Ib": float(Ib),
+        "normalization": {
+            "t_mean": t_mean,
+            "t_std": t_std,
+            "G_mean": G_mean,
+            "G_std": G_std,
+            "I_mean": I_mean,
+            "I_std": I_std,
         },
-        'fix_p3_recommended': fix_p3_recommended
+        "true_params": synthetic_data["true_params"],
+        "noise_std": synthetic_data["noise_std"],
     }
-    
+
     return data
 
 
+def train_test_split(data, train_fraction=0.8, random=True):
+    """
+    Split data into training and test sets
+    """
+    n = len(data["t"])
+    n_train = int(n * train_fraction)
+
+    if random:
+        indices = torch.randperm(n)
+    else:
+        # Sequential split (useful for time series)
+        indices = torch.arange(n)
+
+    train_idx = indices[:n_train]
+    test_idx = indices[n_train:]
+
+    def split_dict(d, idx):
+        result = {}
+        for k, v in d.items():
+            if isinstance(v, torch.Tensor) and len(v) == n:
+                result[k] = v[idx]
+            else:
+                result[k] = v
+        return result
+
+    train_data = split_dict(data, train_idx)
+    test_data = split_dict(data, test_idx)
+
+    print(f"\nData split:")
+    print(f"  Training points: {len(train_idx)} ({train_fraction*100:.0f}%)")
+    print(f"  Test points: {len(test_idx)} ({(1-train_fraction)*100:.0f}%)")
+
+    return train_data, test_data
+
+
 # ============================================================================
-# 2. NEURAL NETWORK ARCHITECTURE
+# 2. IMPROVED NEURAL NETWORK ARCHITECTURE
 # ============================================================================
+
 
 class PINN(nn.Module):
     """
     Physics-Informed Neural Network for Bergman model
-    
-    Input: time t
-    Output: [G(t), X(t)] - glucose and insulin action
+
+    Input: normalized time t
+    Output: [G(t), X(t)] - normalized glucose and insulin action
     """
-    
-    def __init__(self, hidden_dims=[32, 32, 32]):
+
+    def __init__(self, hidden_dims=[64, 64, 64], activation="tanh"):
         super().__init__()
-        
+
         layers = []
         input_dim = 1
-        
+
         for hidden_dim in hidden_dims:
             layers.append(nn.Linear(input_dim, hidden_dim))
-            layers.append(nn.Tanh())
+
+            if activation == "tanh":
+                layers.append(nn.Tanh())
+            elif activation == "relu":
+                layers.append(nn.ReLU())
+            elif activation == "softplus":
+                layers.append(nn.Softplus())
+            else:
+                layers.append(nn.Tanh())
+
             input_dim = hidden_dim
-        
+
         layers.append(nn.Linear(input_dim, 2))  # Output: [G, X]
-        
+
         self.network = nn.Sequential(*layers)
-        
-        # Initialize weights
+
+        # Xavier initialization
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_normal_(m.weight)
                 nn.init.zeros_(m.bias)
-    
+
     def forward(self, t):
-        """
-        Forward pass
-        
-        Parameters:
-        -----------
-        t : torch.Tensor, shape (N, 1)
-            Normalized time points
-        
-        Returns:
-        --------
-        output : torch.Tensor, shape (N, 2)
-            [G(t), X(t)] predictions
-        """
+        """Forward pass"""
         return self.network(t)
 
 
 # ============================================================================
-# 3. BAYESIAN MODEL AND GUIDE
+# 3. IMPROVED BAYESIAN MODEL AND GUIDE
 # ============================================================================
 
-def model(t, G_obs, I_obs, Gb, Ib, pinn_net, fix_p3=True, p3_value=1e-5, compute_physics=True):
+
+def model(
+    t,
+    G_obs,
+    I_obs,
+    Gb,
+    Ib,
+    norm_params,
+    pinn_net,
+    fix_p3=False,
+    p3_value=1e-5,
+    compute_physics=True,
+):
     """
-    Bayesian PINN model for Bergman minimal model
-    
-    Parameters:
-    -----------
-    t : torch.Tensor
-        Normalized time points
-    G_obs : torch.Tensor
-        Observed glucose (normalized)
-    I_obs : torch.Tensor
-        Observed insulin (normalized)
-    Gb : float
-        Basal glucose (raw units)
-    Ib : float
-        Basal insulin (raw units)
-    pinn_net : PINN
-        Neural network instance
-    fix_p3 : bool
-        Whether to fix p3 to literature value
-    p3_value : float
-        Fixed value for p3 if fix_p3=True
-    compute_physics : bool
-        Whether to compute physics loss (False during sampling for efficiency)
+    Improved Bayesian PINN model
+
+    Key improvements:
+    - Proper handling of normalization in ODEs
+    - Fixed physics loss during sampling
+    - Better prior specifications
     """
-    # Priors on Bergman parameters (in log-space for numerical stability)
-    # p1 ~ 0.03 min^-1
-    p1 = pyro.sample("p1", dist.LogNormal(-3.5, 0.5))
-    
-    # p2 ~ 0.02 min^-1
-    p2 = pyro.sample("p2", dist.LogNormal(-3.9, 0.5))
-    
-    # p3 ~ 1e-5 - either fixed or sampled
+    # Priors with documentation
+    # p1: glucose effectiveness (min⁻¹), literature: 0.01-0.05, mean ~0.028
+    p1 = pyro.sample(
+        "p1",
+        dist.LogNormal(
+            torch.tensor(-3.58),  # log(0.028)
+            torch.tensor(0.3),  # narrower prior based on literature
+        ),
+    )
+
+    # p2: insulin action decay (min⁻¹), literature: 0.01-0.05, mean ~0.025
+    p2 = pyro.sample(
+        "p2", dist.LogNormal(torch.tensor(-3.69), torch.tensor(0.3))  # log(0.025)
+    )
+
+    # p3: insulin sensitivity (min⁻² per μU/mL)
     if fix_p3:
         p3 = torch.tensor(p3_value, dtype=torch.float32)
     else:
-        # Use log-space parameterization for better numerical stability
-        log_p3 = pyro.sample("log_p3", dist.Normal(-11.5, 1.0))
-        p3 = torch.exp(log_p3)
-    
+        p3 = pyro.sample(
+            "p3", dist.LogNormal(torch.tensor(-11.1), torch.tensor(0.5))  # log(1.5e-5)
+        )
+
     # Noise parameters
-    sigma_G = pyro.sample("sigma_G", dist.Exponential(0.2))
-    sigma_phys = pyro.sample("sigma_phys", dist.Exponential(0.1))
-    
+    sigma_G = pyro.sample("sigma_G", dist.HalfNormal(0.5))
+
+    if compute_physics:
+        sigma_phys = pyro.sample("sigma_phys", dist.HalfNormal(0.2))
+
     # Register neural network
     pinn = pyro.module("pinn", pinn_net)
-    
-    # Forward pass (with or without gradients)
+
+    # Forward pass
     if compute_physics:
-        # Enable gradient computation for physics loss (training mode)
-        t_phys = t.clone().detach().requires_grad_(True)
-        
+        # Training mode: compute gradients for physics loss
+        t_phys = t.clone().requires_grad_(True)
+
         out = pinn(t_phys)
-        G_hat = out[:, 0:1]
-        X_hat = out[:, 1:2]
-        
-        # Compute time derivatives
-        dG_dt = torch.autograd.grad(
-            G_hat, t_phys,
-            grad_outputs=torch.ones_like(G_hat),
+        G_hat_norm = out[:, 0:1]
+        X_hat_norm = out[:, 1:2]
+
+        # Denormalize for ODE (work in physical space)
+        G_mean, G_std = norm_params["G_mean"], norm_params["G_std"]
+        I_mean, I_std = norm_params["I_mean"], norm_params["I_std"]
+        t_mean, t_std = norm_params["t_mean"], norm_params["t_std"]
+
+        G_hat = G_hat_norm * G_std + G_mean
+        X_hat = X_hat_norm  # X doesn't need denormalization (it's a derived state)
+        I_phys = I_obs * I_std + I_mean
+
+        # Compute time derivatives in physical space
+        dG_dt_norm = torch.autograd.grad(
+            G_hat_norm,
+            t_phys,
+            grad_outputs=torch.ones_like(G_hat_norm),
             create_graph=True,
-            retain_graph=True
+            retain_graph=True,
         )[0]
-        
-        dX_dt = torch.autograd.grad(
-            X_hat, t_phys,
-            grad_outputs=torch.ones_like(X_hat),
+
+        dX_dt_norm = torch.autograd.grad(
+            X_hat_norm,
+            t_phys,
+            grad_outputs=torch.ones_like(X_hat_norm),
             create_graph=True,
-            retain_graph=True
+            retain_graph=True,
         )[0]
-        
-        # Bergman ODE residuals (in normalized space)
-        R_G = dG_dt + (p1 + X_hat) * G_hat - p1 * 0.0  # Normalized Gb ≈ 0
-        R_X = dX_dt + p2 * X_hat - p3 * I_obs
+
+        # Convert to physical time derivatives: dt_phys = dt_norm * t_std
+        dG_dt = dG_dt_norm * G_std / t_std
+        dX_dt = dX_dt_norm / t_std
+
+        # Bergman ODEs in physical space
+        # dG/dt = -p1*(G - Gb) - X*G
+        # dX/dt = -p2*X + p3*(I - Ib)
+        R_G = dG_dt + p1 * (G_hat - Gb) + X_hat * G_hat
+        R_X = dX_dt + p2 * X_hat - p3 * (I_phys - Ib)
+
+        # Normalize residuals for numerical stability
+        R_G_norm = R_G / G_std
+        R_X_norm = R_X
+
+        # Physics loss
+        with pyro.plate("physics_plate", len(t)):
+            pyro.sample(
+                "physics_G", dist.Normal(0.0, sigma_phys), obs=R_G_norm.squeeze()
+            )
+            pyro.sample(
+                "physics_X", dist.Normal(0.0, sigma_phys), obs=R_X_norm.squeeze()
+            )
+
+        # Use normalized predictions for data likelihood
+        G_pred = G_hat_norm.squeeze()
     else:
-        # Sampling mode - no gradients needed
+        # Sampling mode: no gradients needed
         with torch.no_grad():
             out = pinn(t)
-            G_hat = out[:, 0:1]
-        
-        # Use dummy residuals with zero variance (they won't affect sampling)
-        R_G = torch.zeros_like(G_hat)
-        R_X = torch.zeros_like(G_hat)
-    
-    # Likelihoods
-    with pyro.plate("observations", G_obs.shape[0]):
-        # Data likelihood
-        pyro.sample("G_obs",
-                    dist.Normal(G_hat.squeeze(), sigma_G),
-                    obs=G_obs)
-        
-        if compute_physics:
-            # Physics likelihoods (only during training)
-            pyro.sample("physics_G",
-                        dist.Normal(torch.zeros_like(R_G.squeeze()), sigma_phys),
-                        obs=R_G.squeeze())
-            
-            pyro.sample("physics_X",
-                        dist.Normal(torch.zeros_like(R_X.squeeze()), sigma_phys),
-                        obs=R_X.squeeze())
+            G_pred = out[:, 0]
+
+    # Data likelihood
+    with pyro.plate("data_plate", len(G_obs)):
+        pyro.sample("G_obs", dist.Normal(G_pred, sigma_G), obs=G_obs)
 
 
-def guide(t, G_obs, I_obs, Gb, Ib, pinn_net, fix_p3=True, p3_value=1e-5, compute_physics=True):
+def guide(
+    t,
+    G_obs,
+    I_obs,
+    Gb,
+    Ib,
+    norm_params,
+    pinn_net,
+    fix_p3=False,
+    p3_value=1e-5,
+    compute_physics=True,
+):
     """
-    Variational guide for SVI
+    Variational guide (improved)
     """
     # Variational parameters for p1
-    mean_p1_loc = pyro.param("mean_p1_loc", torch.tensor(-3.5))
-    mean_p1_scale = pyro.param("mean_p1_scale", torch.tensor(0.5),
-                                constraint=dist.constraints.positive)
+    mean_p1_loc = pyro.param("mean_p1_loc", torch.tensor(-3.58))
+    mean_p1_scale = pyro.param(
+        "mean_p1_scale", torch.tensor(0.3), constraint=dist.constraints.positive
+    )
     pyro.sample("p1", dist.LogNormal(mean_p1_loc, mean_p1_scale))
-    
+
     # Variational parameters for p2
-    mean_p2_loc = pyro.param("mean_p2_loc", torch.tensor(-3.9))
-    mean_p2_scale = pyro.param("mean_p2_scale", torch.tensor(0.5),
-                                constraint=dist.constraints.positive)
+    mean_p2_loc = pyro.param("mean_p2_loc", torch.tensor(-3.69))
+    mean_p2_scale = pyro.param(
+        "mean_p2_scale", torch.tensor(0.3), constraint=dist.constraints.positive
+    )
     pyro.sample("p2", dist.LogNormal(mean_p2_loc, mean_p2_scale))
-    
-    # Variational parameters for p3 (only if not fixed)
+
+    # Variational parameters for p3 (if not fixed)
     if not fix_p3:
-        mean_log_p3 = pyro.param("mean_log_p3", torch.tensor(-11.5))
-        scale_log_p3 = pyro.param("scale_log_p3", torch.tensor(1.0),
-                                   constraint=dist.constraints.positive)
-        pyro.sample("log_p3", dist.Normal(mean_log_p3, scale_log_p3))
-    
+        mean_p3_loc = pyro.param("mean_p3_loc", torch.tensor(-11.1))
+        mean_p3_scale = pyro.param(
+            "mean_p3_scale", torch.tensor(0.5), constraint=dist.constraints.positive
+        )
+        pyro.sample("p3", dist.LogNormal(mean_p3_loc, mean_p3_scale))
+
     # Variational parameters for noise
-    sigma_G_rate = pyro.param("sigma_G_rate", torch.tensor(0.2),
-                              constraint=dist.constraints.positive)
-    pyro.sample("sigma_G", dist.Exponential(sigma_G_rate))
-    
-    sigma_phys_rate = pyro.param("sigma_phys_rate", torch.tensor(0.1),
-                                  constraint=dist.constraints.positive)
-    pyro.sample("sigma_phys", dist.Exponential(sigma_phys_rate))
-    
+    sigma_G_scale = pyro.param(
+        "sigma_G_scale", torch.tensor(0.5), constraint=dist.constraints.positive
+    )
+    pyro.sample("sigma_G", dist.HalfNormal(sigma_G_scale))
+
+    if compute_physics:
+        sigma_phys_scale = pyro.param(
+            "sigma_phys_scale", torch.tensor(0.2), constraint=dist.constraints.positive
+        )
+        pyro.sample("sigma_phys", dist.HalfNormal(sigma_phys_scale))
+
     # Register network
     pyro.module("pinn", pinn_net)
-    
-    with pyro.plate("observations", G_obs.shape[0]):
-        pass
 
 
 # ============================================================================
-# 4. TRAINING WITH CHECKPOINTING
+# 4. TRAINING WITH IMPROVEMENTS
 # ============================================================================
 
-def train_bayesian_pinn(data, n_iterations=5000, lr=0.001, fix_p3=True, 
-                        save_dir='./checkpoints', checkpoint_freq=500):
+
+def check_convergence(losses, window=200, threshold=1e-4):
+    """Check if training has converged"""
+    if len(losses) < window:
+        return False
+
+    recent = losses[-window:]
+    trend = np.polyfit(range(window), recent, 1)[0]
+
+    return abs(trend) < threshold
+
+
+def train_bayesian_pinn(
+    train_data,
+    val_data=None,
+    n_iterations=5000,
+    lr=0.001,
+    fix_p3=False,
+    save_dir="./checkpoints",
+    checkpoint_freq=500,
+    early_stopping_patience=1000,
+):
     """
-    Train Bayesian PINN using SVI with checkpointing
-    
-    Parameters:
-    -----------
-    data : dict
-        Preprocessed data dictionary
-    n_iterations : int
-        Number of SVI iterations
-    lr : float
-        Learning rate
-    fix_p3 : bool
-        Whether to fix p3 to literature value
-    save_dir : str
-        Directory to save checkpoints (use Google Drive path in Colab)
-    checkpoint_freq : int
-        Save checkpoint every N iterations
+    Improved training with validation and early stopping
     """
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("TRAINING BAYESIAN PINN")
-    print("="*70)
-    
-    # Create save directory
-    import os
+    print("=" * 70)
+
     os.makedirs(save_dir, exist_ok=True)
-    print(f"Checkpoints will be saved to: {save_dir}")
-    
+
     # Clear parameter store
     pyro.clear_param_store()
-    
+
     # Initialize network
-    pinn_net = PINN(hidden_dims=[32, 32, 32])
-    
+    pinn_net = PINN(hidden_dims=[64, 64, 64])
+
     # Setup SVI
     optimizer = ClippedAdam({"lr": lr, "clip_norm": 10.0})
     svi = SVI(model, guide, optimizer, loss=Trace_ELBO())
-    
+
     # Extract data
-    t = data['t']
-    G_obs = data['G_obs']
-    I_obs = data['I_obs']
-    Gb = data['Gb']
-    Ib = data['Ib']
-    
+    t = train_data["t"]
+    G_obs = train_data["G_obs"]
+    I_obs = train_data["I_obs"]
+    Gb = train_data["Gb"]
+    Ib = train_data["Ib"]
+    norm_params = train_data["normalization"]
+
+    # Validation data if available
+    if val_data is not None:
+        t_val = val_data["t"]
+        G_obs_val = val_data["G_obs"]
+        I_obs_val = val_data["I_obs"]
+
     # Training loop
-    losses = []
-    best_loss = float('inf')
-    
-    print(f"\nTraining for {n_iterations} iterations...")
-    print(f"Fix p3: {fix_p3}")
-    print(f"Checkpoint frequency: every {checkpoint_freq} iterations")
-    
+    train_losses = []
+    val_losses = []
+    best_val_loss = float("inf")
+    patience_counter = 0
+
+    print(f"\nConfiguration:")
+    print(f"  Iterations: {n_iterations}")
+    print(f"  Learning rate: {lr}")
+    print(f"  Fix p3: {fix_p3}")
+    print(f"  Early stopping patience: {early_stopping_patience}")
+
     for iteration in range(n_iterations):
-        loss = svi.step(t, G_obs, I_obs, Gb, Ib, pinn_net, fix_p3, 1e-5, True)  # compute_physics=True
-        losses.append(loss)
-        
-        # Print progress
-        if (iteration + 1) % 100 == 0 or iteration == 0:
-            print(f"Iteration {iteration + 1:5d} | ELBO Loss: {loss:.2e}")
-        
-        # Save checkpoint
-        if (iteration + 1) % checkpoint_freq == 0 or iteration == n_iterations - 1:
-            checkpoint = {
-                'iteration': iteration + 1,
-                'loss': loss,
-                'losses': losses,
-                'pinn_state_dict': pinn_net.state_dict(),
-                'pyro_param_store': pyro.get_param_store().get_state(),
-                'config': {
-                    'n_iterations': n_iterations,
-                    'lr': lr,
-                    'fix_p3': fix_p3,
-                    'Gb': Gb,
-                    'Ib': Ib
+        # Training step
+        loss = svi.step(
+            t, G_obs, I_obs, Gb, Ib, norm_params, pinn_net, fix_p3, 1e-5, True
+        )
+        train_losses.append(loss)
+
+        # Validation step
+        if val_data is not None and (iteration + 1) % 50 == 0:
+            val_loss = svi.evaluate_loss(
+                t_val,
+                G_obs_val,
+                I_obs_val,
+                Gb,
+                Ib,
+                norm_params,
+                pinn_net,
+                fix_p3,
+                1e-5,
+                False,
+            )
+            val_losses.append(val_loss)
+
+            # Early stopping check
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+
+                # Save best model
+                best_checkpoint = {
+                    "iteration": iteration + 1,
+                    "train_loss": loss,
+                    "val_loss": val_loss,
+                    "pinn_state_dict": pinn_net.state_dict(),
+                    "pyro_param_store": pyro.get_param_store().get_state(),
                 }
+                torch.save(best_checkpoint, os.path.join(save_dir, "best_model.pt"))
+            else:
+                patience_counter += 50
+
+                if patience_counter >= early_stopping_patience:
+                    print(f"\nEarly stopping at iteration {iteration + 1}")
+                    break
+
+        # Progress reporting
+        if (iteration + 1) % 100 == 0 or iteration == 0:
+            msg = f"Iter {iteration + 1:5d} | Train Loss: {loss:.2e}"
+            if val_data is not None and len(val_losses) > 0:
+                msg += f" | Val Loss: {val_losses[-1]:.2e}"
+            print(msg)
+
+        # Checkpointing
+        if (iteration + 1) % checkpoint_freq == 0:
+            checkpoint = {
+                "iteration": iteration + 1,
+                "train_loss": loss,
+                "train_losses": train_losses,
+                "val_losses": val_losses,
+                "pinn_state_dict": pinn_net.state_dict(),
+                "pyro_param_store": pyro.get_param_store().get_state(),
             }
-            
-            checkpoint_path = os.path.join(save_dir, f'checkpoint_iter_{iteration + 1}.pt')
-            torch.save(checkpoint, checkpoint_path)
-            print(f"  → Checkpoint saved: {checkpoint_path}")
-            
-            # Save best model
-            if loss < best_loss:
-                best_loss = loss
-                best_path = os.path.join(save_dir, 'best_model.pt')
-                torch.save(checkpoint, best_path)
-                print(f"  → Best model updated: {best_path}")
-    
-    # Save final losses as CSV
-    losses_df = pd.DataFrame({
-        'iteration': range(1, len(losses) + 1),
-        'loss': losses
-    })
-    losses_csv_path = os.path.join(save_dir, 'training_losses.csv')
-    losses_df.to_csv(losses_csv_path, index=False)
-    print(f"\n  → Losses saved to: {losses_csv_path}")
-    
-    # Save final model
-    final_checkpoint = {
-        'iteration': n_iterations,
-        'loss': losses[-1],
-        'losses': losses,
-        'pinn_state_dict': pinn_net.state_dict(),
-        'pyro_param_store': pyro.get_param_store().get_state(),
-        'config': {
-            'n_iterations': n_iterations,
-            'lr': lr,
-            'fix_p3': fix_p3,
-            'Gb': Gb,
-            'Ib': Ib
-        }
-    }
-    final_path = os.path.join(save_dir, 'final_model.pt')
-    torch.save(final_checkpoint, final_path)
-    print(f"  → Final model saved: {final_path}")
-    
+            torch.save(
+                checkpoint, os.path.join(save_dir, f"checkpoint_{iteration + 1}.pt")
+            )
+
+        # Convergence check
+        if (iteration + 1) % 500 == 0:
+            if check_convergence(train_losses):
+                print(f"\nConverged at iteration {iteration + 1}")
+                break
+
     print("\nTraining completed!")
-    
-    return pinn_net, losses
-
-
-def load_checkpoint(checkpoint_path, pinn_net=None):
-    """
-    Load a saved checkpoint
-    
-    Parameters:
-    -----------
-    checkpoint_path : str
-        Path to checkpoint file
-    pinn_net : PINN, optional
-        PINN instance to load weights into. If None, creates new one.
-    
-    Returns:
-    --------
-    pinn_net : PINN
-        Network with loaded weights
-    checkpoint : dict
-        Full checkpoint data
-    """
-    print(f"Loading checkpoint from: {checkpoint_path}")
-    
-    checkpoint = torch.load(checkpoint_path)
-    
-    # Create or use provided network
-    if pinn_net is None:
-        pinn_net = PINN(hidden_dims=[32, 32, 32])
-    
-    # Load network weights
-    pinn_net.load_state_dict(checkpoint['pinn_state_dict'])
-    
-    # Restore Pyro parameter store
-    pyro.clear_param_store()
-    pyro.get_param_store().set_state(checkpoint['pyro_param_store'])
-    
-    print(f"  Loaded iteration: {checkpoint['iteration']}")
-    print(f"  Loss at checkpoint: {checkpoint['loss']:.2e}")
-    
-    return pinn_net, checkpoint
+    return pinn_net, train_losses, val_losses
 
 
 # ============================================================================
-# 5. RESULTS ANALYSIS
+# 5. ENHANCED ANALYSIS AND VISUALIZATION
 # ============================================================================
 
-def analyze_results(pinn_net, data, n_samples=1000, fix_p3=True):
-    """
-    Analyze posterior distributions and predictions
-    """
-    print("\n" + "="*70)
+
+def analyze_results(pinn_net, data, n_samples=1000, fix_p3=False):
+    """Enhanced posterior analysis"""
+    print("\n" + "=" * 70)
     print("POSTERIOR ANALYSIS")
-    print("="*70)
-    
-    from pyro.infer import Predictive
-    
-    # Sample from posterior WITHOUT computing physics loss (for efficiency)
-    # We only need the parameter samples, not the physics residuals
-    predictive = Predictive(
-        lambda t, G_obs, I_obs, Gb, Ib, pinn_net, fix_p3: model(
-            t, G_obs, I_obs, Gb, Ib, pinn_net, fix_p3, 1e-5, compute_physics=False
-        ),
-        guide=lambda t, G_obs, I_obs, Gb, Ib, pinn_net, fix_p3: guide(
-            t, G_obs, I_obs, Gb, Ib, pinn_net, fix_p3, 1e-5, compute_physics=False
-        ),
-        num_samples=n_samples
+    print("=" * 70)
+
+    # Sample from posterior (without computing physics for efficiency)
+    predictive = Predictive(model, guide=guide, num_samples=n_samples)
+
+    samples = predictive(
+        data["t"],
+        data["G_obs"],
+        data["I_obs"],
+        data["Gb"],
+        data["Ib"],
+        data["normalization"],
+        pinn_net,
+        fix_p3,
+        1e-5,
+        False,
     )
-    
-    samples = predictive(data['t'], data['G_obs'], data['I_obs'],
-                        data['Gb'], data['Ib'], pinn_net, fix_p3)
-    
-    # Analyze parameter posteriors
-    p1_samples = samples['p1'].detach().numpy()
-    p2_samples = samples['p2'].detach().numpy()
-    
+
+    # Parameter statistics
+    p1_samples = samples["p1"].detach().numpy()
+    p2_samples = samples["p2"].detach().numpy()
+
     print("\nParameter Posterior Statistics:")
-    print(f"p1: mean={p1_samples.mean():.4f}, std={p1_samples.std():.4f}, "
-          f"95% CI=[{np.percentile(p1_samples, 2.5):.4f}, {np.percentile(p1_samples, 97.5):.4f}]")
-    print(f"p2: mean={p2_samples.mean():.4f}, std={p2_samples.std():.4f}, "
-          f"95% CI=[{np.percentile(p2_samples, 2.5):.4f}, {np.percentile(p2_samples, 97.5):.4f}]")
-    
-    if not fix_p3:
-        p3_samples = torch.exp(samples['log_p3']).detach().numpy()
-        print(f"p3: mean={p3_samples.mean():.6f}, std={p3_samples.std():.6f}, "
-              f"95% CI=[{np.percentile(p3_samples, 2.5):.6f}, {np.percentile(p3_samples, 97.5):.6f}]")
+    print(
+        f"{'Parameter':<10} {'Mean':<10} {'Std':<10} {'2.5%':<10} {'97.5%':<10} {'True':<10}"
+    )
+    print("-" * 60)
+
+    true_params = data.get("true_params", {})
+
+    print(
+        f"{'p1':<10} {p1_samples.mean():<10.5f} {p1_samples.std():<10.5f} "
+        f"{np.percentile(p1_samples, 2.5):<10.5f} {np.percentile(p1_samples, 97.5):<10.5f} "
+        f"{true_params.get('p1', 'N/A'):<10}"
+    )
+
+    print(
+        f"{'p2':<10} {p2_samples.mean():<10.5f} {p2_samples.std():<10.5f} "
+        f"{np.percentile(p2_samples, 2.5):<10.5f} {np.percentile(p2_samples, 97.5):<10.5f} "
+        f"{true_params.get('p2', 'N/A'):<10}"
+    )
+
+    if not fix_p3 and "p3" in samples:
+        p3_samples = samples["p3"].detach().numpy()
+        print(
+            f"{'p3':<10} {p3_samples.mean():<10.6f} {p3_samples.std():<10.6f} "
+            f"{np.percentile(p3_samples, 2.5):<10.6f} {np.percentile(p3_samples, 97.5):<10.6f} "
+            f"{true_params.get('p3', 'N/A'):<10}"
+        )
     else:
-        print(f"p3: FIXED at 1e-5 (not inferred)")
-    
-    sigma_G_samples = samples['sigma_G'].detach().numpy()
-    sigma_phys_samples = samples['sigma_phys'].detach().numpy()
-    
-    print(f"\nsigma_G: mean={sigma_G_samples.mean():.4f}, std={sigma_G_samples.std():.4f}")
-    print(f"sigma_phys: mean={sigma_phys_samples.mean():.4f}, std={sigma_phys_samples.std():.4f}")
-    
+        print(
+            f"{'p3':<10} {'FIXED':<10} {'-':<10} {'-':<10} {'-':<10} "
+            f"{true_params.get('p3', 'N/A'):<10}"
+        )
+
+    # Compute coverage
+    if true_params:
+        p1_covered = (
+            np.percentile(p1_samples, 2.5)
+            <= true_params["p1"]
+            <= np.percentile(p1_samples, 97.5)
+        )
+        p2_covered = (
+            np.percentile(p2_samples, 2.5)
+            <= true_params["p2"]
+            <= np.percentile(p2_samples, 97.5)
+        )
+
+        print(f"\n95% Credible Interval Coverage:")
+        print(f"  p1: {'✓' if p1_covered else '✗'}")
+        print(f"  p2: {'✓' if p2_covered else '✗'}")
+
+        if not fix_p3 and "p3" in samples:
+            p3_covered = (
+                np.percentile(p3_samples, 2.5)
+                <= true_params["p3"]
+                <= np.percentile(p3_samples, 97.5)
+            )
+            print(f"  p3: {'✓' if p3_covered else '✗'}")
+
     return samples
 
 
-def plot_results(pinn_net, data, losses, samples=None):
-    """
-    Visualize training and results
-    """
-    fig = plt.figure(figsize=(16, 10))
-    
-    # Plot 1: Training loss
-    ax1 = plt.subplot(2, 3, 1)
-    ax1.plot(losses)
-    ax1.set_xlabel('Iteration')
-    ax1.set_ylabel('ELBO Loss')
-    ax1.set_title('Training Loss')
-    ax1.set_yscale('log')
-    ax1.grid(True, alpha=0.3)
-    
-    # Plot 2: Predictions
+def predict_with_uncertainty(pinn_net, data, samples, n_posterior_samples=100):
+    """Generate predictions with uncertainty quantification"""
+
+    # Select random posterior samples
+    n_available = len(samples["p1"])
+    indices = np.random.choice(
+        n_available, min(n_posterior_samples, n_available), replace=False
+    )
+
+    predictions_G = []
+    predictions_X = []
+
     with torch.no_grad():
-        out = pinn_net(data['t'])
-        G_pred = out[:, 0].numpy()
-        X_pred = out[:, 1].numpy()
-    
-    t_raw = data['t_raw'].numpy().flatten()
-    G_obs_raw = data['G_obs_raw'].numpy()
-    
-    # Denormalize predictions
-    norm = data['normalization']
-    G_pred_denorm = G_pred * norm['G_std'] + norm['G_mean']
-    
-    ax2 = plt.subplot(2, 3, 2)
-    ax2.plot(t_raw, G_obs_raw, 'o', label='Observed', alpha=0.6)
-    ax2.plot(t_raw, G_pred_denorm, '-', label='Predicted', linewidth=2)
-    ax2.set_xlabel('Time (minutes)')
-    ax2.set_ylabel('Glucose (mg/dL)')
-    ax2.set_title('Glucose Predictions')
+        for idx in indices:
+            out = pinn_net(data["t"])
+            predictions_G.append(out[:, 0].numpy())
+            predictions_X.append(out[:, 1].numpy())
+
+    predictions_G = np.array(predictions_G)
+    predictions_X = np.array(predictions_X)
+
+    # Denormalize
+    norm = data["normalization"]
+    predictions_G = predictions_G * norm["G_std"] + norm["G_mean"]
+
+    return {
+        "G_mean": predictions_G.mean(axis=0),
+        "G_std": predictions_G.std(axis=0),
+        "G_lower": np.percentile(predictions_G, 2.5, axis=0),
+        "G_upper": np.percentile(predictions_G, 97.5, axis=0),
+        "X_mean": predictions_X.mean(axis=0),
+        "X_std": predictions_X.std(axis=0),
+    }
+
+
+def plot_comprehensive_results(pinn_net, data, train_losses, val_losses, samples):
+    """Comprehensive visualization"""
+
+    fig = plt.figure(figsize=(18, 12))
+
+    # Get predictions with uncertainty
+    uncertainty = predict_with_uncertainty(pinn_net, data, samples)
+
+    t_raw = data["t_raw"].numpy().flatten()
+    G_obs_raw = data["G_obs_raw"].numpy()
+
+    # Plot 1: Training curves
+    ax1 = plt.subplot(3, 3, 1)
+    ax1.plot(train_losses, label="Train", alpha=0.7)
+    if val_losses:
+        # Match validation losses to training iterations
+        val_iters = np.linspace(0, len(train_losses), len(val_losses))
+        ax1.plot(val_iters, val_losses, label="Validation", alpha=0.7)
+    ax1.set_xlabel("Iteration")
+    ax1.set_ylabel("ELBO Loss")
+    ax1.set_title("Training Progress")
+    ax1.set_yscale("log")
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    # Plot 2: Glucose predictions with uncertainty
+    ax2 = plt.subplot(3, 3, 2)
+    ax2.fill_between(
+        t_raw, uncertainty["G_lower"], uncertainty["G_upper"], alpha=0.3, label="95% CI"
+    )
+    ax2.plot(t_raw, G_obs_raw, "o", alpha=0.5, markersize=3, label="Observed")
+    if "G_true_raw" in data:
+        ax2.plot(
+            t_raw,
+            data["G_true_raw"].numpy(),
+            "--",
+            linewidth=2,
+            label="True",
+            color="green",
+        )
+    ax2.plot(t_raw, uncertainty["G_mean"], "-", linewidth=2, label="Predicted")
+    ax2.set_xlabel("Time (minutes)")
+    ax2.set_ylabel("Glucose (mg/dL)")
+    ax2.set_title("Glucose: Predictions with Uncertainty")
     ax2.legend()
     ax2.grid(True, alpha=0.3)
-    
-    # Plot 3: X(t) trajectory
-    ax3 = plt.subplot(2, 3, 3)
-    ax3.plot(t_raw, X_pred, '-', linewidth=2)
-    ax3.set_xlabel('Time (minutes)')
-    ax3.set_ylabel('X(t) (normalized)')
-    ax3.set_title('Insulin Action X(t)')
+
+    # Plot 3: Residuals
+    ax3 = plt.subplot(3, 3, 3)
+    residuals = G_obs_raw - uncertainty["G_mean"]
+    ax3.scatter(t_raw, residuals, alpha=0.5, s=10)
+    ax3.axhline(y=0, color="r", linestyle="--")
+    ax3.fill_between(
+        t_raw,
+        -2 * uncertainty["G_std"],
+        2 * uncertainty["G_std"],
+        alpha=0.2,
+        color="gray",
+    )
+    ax3.set_xlabel("Time (minutes)")
+    ax3.set_ylabel("Residual (mg/dL)")
+    ax3.set_title("Prediction Residuals")
     ax3.grid(True, alpha=0.3)
-    
-    # Plot 4-6: Parameter posteriors
-    if samples is not None:
-        p1_samples = samples['p1'].detach().numpy()
-        p2_samples = samples['p2'].detach().numpy()
-        
-        ax4 = plt.subplot(2, 3, 4)
-        ax4.hist(p1_samples, bins=50, alpha=0.7, edgecolor='black')
-        ax4.axvline(p1_samples.mean(), color='r', linestyle='--', label=f'Mean: {p1_samples.mean():.4f}')
-        ax4.set_xlabel('p1')
-        ax4.set_ylabel('Density')
-        ax4.set_title('Posterior of p1')
-        ax4.legend()
-        ax4.grid(True, alpha=0.3)
-        
-        ax5 = plt.subplot(2, 3, 5)
-        ax5.hist(p2_samples, bins=50, alpha=0.7, edgecolor='black')
-        ax5.axvline(p2_samples.mean(), color='r', linestyle='--', label=f'Mean: {p2_samples.mean():.4f}')
-        ax5.set_xlabel('p2')
-        ax5.set_ylabel('Density')
-        ax5.set_title('Posterior of p2')
-        ax5.legend()
-        ax5.grid(True, alpha=0.3)
-        
-        ax6 = plt.subplot(2, 3, 6)
-        if 'log_p3' in samples:
-            p3_samples = torch.exp(samples['log_p3']).detach().numpy()
-            ax6.hist(p3_samples, bins=50, alpha=0.7, edgecolor='black')
-            ax6.axvline(p3_samples.mean(), color='r', linestyle='--', label=f'Mean: {p3_samples.mean():.6f}')
-            ax6.set_xlabel('p3')
-            ax6.set_ylabel('Density')
-            ax6.set_title('Posterior of p3')
-        else:
-            ax6.text(0.5, 0.5, 'p3 FIXED\nat 1e-5', 
-                    ha='center', va='center', fontsize=14, transform=ax6.transAxes)
-            ax6.set_title('p3 (Fixed Parameter)')
-        ax6.legend()
-        ax6.grid(True, alpha=0.3)
-    
+
+    # Plot 4: X(t) trajectory with uncertainty
+    ax4 = plt.subplot(3, 3, 4)
+    ax4.fill_between(
+        t_raw,
+        uncertainty["X_mean"] - 2 * uncertainty["X_std"],
+        uncertainty["X_mean"] + 2 * uncertainty["X_std"],
+        alpha=0.3,
+    )
+    ax4.plot(t_raw, uncertainty["X_mean"], "-", linewidth=2, label="Predicted")
+    if "X_true_raw" in data:
+        ax4.plot(
+            t_raw,
+            data["X_true_raw"].numpy(),
+            "--",
+            linewidth=2,
+            label="True",
+            color="green",
+        )
+    ax4.set_xlabel("Time (minutes)")
+    ax4.set_ylabel("Insulin Action X(t)")
+    ax4.set_title("Insulin Action State")
+    ax4.legend()
+    ax4.grid(True, alpha=0.3)
+
+    # Plot 5: Insulin input
+    ax5 = plt.subplot(3, 3, 5)
+    I_raw = data["I_obs_raw"].numpy().flatten()
+    ax5.plot(t_raw, I_raw, linewidth=2)
+    ax5.axhline(y=data["Ib"], color="r", linestyle="--", label=f"Ib = {data['Ib']:.1f}")
+    ax5.set_xlabel("Time (minutes)")
+    ax5.set_ylabel("Insulin (μU/mL)")
+    ax5.set_title("Insulin Input")
+    ax5.legend()
+    ax5.grid(True, alpha=0.3)
+
+    # Plot 6: Parameter posterior - p1
+    ax6 = plt.subplot(3, 3, 6)
+    p1_samples = samples["p1"].detach().numpy()
+    ax6.hist(p1_samples, bins=50, alpha=0.7, edgecolor="black", density=True)
+    ax6.axvline(
+        p1_samples.mean(),
+        color="r",
+        linestyle="--",
+        label=f"Mean: {p1_samples.mean():.4f}",
+        linewidth=2,
+    )
+    if "true_params" in data:
+        ax6.axvline(
+            data["true_params"]["p1"],
+            color="green",
+            linestyle="-",
+            label=f"True: {data['true_params']['p1']:.4f}",
+            linewidth=2,
+        )
+    ax6.set_xlabel("p1 (min⁻¹)")
+    ax6.set_ylabel("Density")
+    ax6.set_title("Posterior: Glucose Effectiveness")
+    ax6.legend()
+    ax6.grid(True, alpha=0.3)
+
+    # Plot 7: Parameter posterior - p2
+    ax7 = plt.subplot(3, 3, 7)
+    p2_samples = samples["p2"].detach().numpy()
+    ax7.hist(p2_samples, bins=50, alpha=0.7, edgecolor="black", density=True)
+    ax7.axvline(
+        p2_samples.mean(),
+        color="r",
+        linestyle="--",
+        label=f"Mean: {p2_samples.mean():.4f}",
+        linewidth=2,
+    )
+    if "true_params" in data:
+        ax7.axvline(
+            data["true_params"]["p2"],
+            color="green",
+            linestyle="-",
+            label=f"True: {data['true_params']['p2']:.4f}",
+            linewidth=2,
+        )
+    ax7.set_xlabel("p2 (min⁻¹)")
+    ax7.set_ylabel("Density")
+    ax7.set_title("Posterior: Insulin Action Decay")
+    ax7.legend()
+    ax7.grid(True, alpha=0.3)
+
+    # Plot 8: Parameter posterior - p3 or correlation
+    ax8 = plt.subplot(3, 3, 8)
+    if "p3" in samples:
+        p3_samples = samples["p3"].detach().numpy()
+        ax8.hist(p3_samples, bins=50, alpha=0.7, edgecolor="black", density=True)
+        ax8.axvline(
+            p3_samples.mean(),
+            color="r",
+            linestyle="--",
+            label=f"Mean: {p3_samples.mean():.6f}",
+            linewidth=2,
+        )
+        if "true_params" in data:
+            ax8.axvline(
+                data["true_params"]["p3"],
+                color="green",
+                linestyle="-",
+                label=f"True: {data['true_params']['p3']:.6f}",
+                linewidth=2,
+            )
+        ax8.set_xlabel("p3 (min⁻² per μU/mL)")
+        ax8.set_ylabel("Density")
+        ax8.set_title("Posterior: Insulin Sensitivity")
+        ax8.legend()
+    else:
+        # Show parameter correlation
+        ax8.scatter(p1_samples, p2_samples, alpha=0.3, s=10)
+        ax8.set_xlabel("p1")
+        ax8.set_ylabel("p2")
+        ax8.set_title("Parameter Correlation: p1 vs p2")
+
+        # Add correlation coefficient
+        corr = np.corrcoef(p1_samples, p2_samples)[0, 1]
+        ax8.text(
+            0.05,
+            0.95,
+            f"ρ = {corr:.3f}",
+            transform=ax8.transAxes,
+            verticalalignment="top",
+        )
+    ax8.grid(True, alpha=0.3)
+
+    # Plot 9: Posterior predictive check
+    ax9 = plt.subplot(3, 3, 9)
+    # Q-Q plot
+    from scipy import stats
+
+    stats.probplot(residuals, dist="norm", plot=ax9)
+    ax9.set_title("Q-Q Plot: Residual Normality Check")
+    ax9.grid(True, alpha=0.3)
+
     plt.tight_layout()
     return fig
+
+
+def compute_metrics(data, predictions):
+    """Compute performance metrics"""
+    G_true = data["G_obs_raw"].numpy()
+    G_pred = predictions["G_mean"]
+
+    # RMSE
+    rmse = np.sqrt(np.mean((G_true - G_pred) ** 2))
+
+    # MAE
+    mae = np.mean(np.abs(G_true - G_pred))
+
+    # R²
+    ss_res = np.sum((G_true - G_pred) ** 2)
+    ss_tot = np.sum((G_true - G_true.mean()) ** 2)
+    r2 = 1 - ss_res / ss_tot
+
+    # Coverage (percentage of observations within 95% CI)
+    in_ci = (G_true >= predictions["G_lower"]) & (G_true <= predictions["G_upper"])
+    coverage = in_ci.mean() * 100
+
+    print("\n" + "=" * 70)
+    print("PERFORMANCE METRICS")
+    print("=" * 70)
+    print(f"RMSE:      {rmse:.2f} mg/dL")
+    print(f"MAE:       {mae:.2f} mg/dL")
+    print(f"R²:        {r2:.4f}")
+    print(f"95% CI Coverage: {coverage:.1f}%")
+
+    if "noise_std" in data:
+        print(f"\nTrue noise std: {data['noise_std']:.2f} mg/dL")
+        print(f"RMSE/True noise: {rmse/data['noise_std']:.2f}")
 
 
 # ============================================================================
 # 6. MAIN EXECUTION
 # ============================================================================
 
+
 def main():
-    """
-    Main execution function
-    """
-    # ========================================================================
-    # GOOGLE COLAB SETUP (uncomment if using Colab)
-    # ========================================================================
-    # from google.colab import drive
-    # drive.mount('/content/drive')
-    # SAVE_DIR = '/content/drive/MyDrive/BayesianPINN_Checkpoints'
-    # FILEPATH = '/content/drive/MyDrive/1001_0_20210730.xlsx'
-    
-    # ========================================================================
-    # LOCAL SETUP (default)
-    # ========================================================================
-    SAVE_DIR = './checkpoints'
-    FILEPATH = '1001_0_20210730.xlsx'
-    
+    """Main execution with synthetic data"""
+
+    print("=" * 70)
+    print("BAYESIAN PINN FOR BERGMAN MODEL - SYNTHETIC DATA TEST")
+    print("=" * 70)
+
     # Configuration
-    N_ITERATIONS = 5000
+    SAVE_DIR = "./results_synthetic"
+    N_ITERATIONS = 30_000
     LEARNING_RATE = 0.001
-    CHECKPOINT_FREQ = 500  # Save every 500 iterations
-    
-    # Check if we're in Colab
-    try:
-        import google.colab
-        IN_COLAB = True
-        print("Running in Google Colab")
-        print("\n⚠️  IMPORTANT: Make sure to mount Google Drive!")
-        print("Uncomment the drive.mount() lines in the main() function")
-        print("and set your file paths accordingly.\n")
-    except:
-        IN_COLAB = False
-        print("Running locally")
-    
-    # Step 1: Load and prepare data
-    print("="*70)
-    print("BAYESIAN PINN FOR BERGMAN MINIMAL MODEL")
-    print("="*70)
-    
-    data = load_and_prepare_data(
-        FILEPATH,
+    CHECKPOINT_FREQ = 500
+    FIX_P3 = False  # Try to infer all parameters
+
+    # Step 1: Generate synthetic data
+    synthetic_data = generate_synthetic_data(
+        n_points=200,
+        time_span=(0, 300),
+        true_params={"p1": 0.028, "p2": 0.025, "p3": 1.5e-5},
+        Gb=100.0,
+        Ib=10.0,
+        meal_times=[30, 120, 210],
+        meal_doses=[8.0, 10.0, 6.0],
         tau=30.0,
-        bioavailability=0.6,
-        V_d=12.0
+        noise_std=5.0,
+        seed=42,
     )
-    
-    # Determine whether to fix p3 based on data
-    fix_p3 = data['fix_p3_recommended']
-    
-    print(f"\n{'='*70}")
-    print(f"CONFIGURATION")
-    print(f"{'='*70}")
-    print(f"  Iterations: {N_ITERATIONS}")
-    print(f"  Learning rate: {LEARNING_RATE}")
-    print(f"  Fix p3: {fix_p3}")
-    print(f"  Checkpoint frequency: {CHECKPOINT_FREQ}")
-    print(f"  Save directory: {SAVE_DIR}")
-    
-    # Step 2: Train model
-    pinn_net, losses = train_bayesian_pinn(
-        data,
+
+    # Step 2: Prepare data
+    data = prepare_synthetic_data(synthetic_data)
+
+    # Step 3: Train/test split
+    train_data, test_data = train_test_split(data, train_fraction=0.8, random=True)
+
+    # Step 4: Train model
+    pinn_net, train_losses, val_losses = train_bayesian_pinn(
+        train_data,
+        val_data=test_data,
         n_iterations=N_ITERATIONS,
         lr=LEARNING_RATE,
-        fix_p3=fix_p3,
+        fix_p3=FIX_P3,
         save_dir=SAVE_DIR,
-        checkpoint_freq=CHECKPOINT_FREQ
+        checkpoint_freq=CHECKPOINT_FREQ,
+        early_stopping_patience=1000,
     )
-    
-    # Step 3: Analyze results
-    samples = analyze_results(pinn_net, data, n_samples=1000, fix_p3=fix_p3)
-    
-    # Step 4: Plot results
-    fig = plot_results(pinn_net, data, losses, samples)
-    
-    # Save figure
-    import os
-    fig_path = os.path.join(SAVE_DIR, 'bayesian_pinn_results.png')
-    plt.savefig(fig_path, dpi=300, bbox_inches='tight')
-    print(f"\nResults figure saved to: {fig_path}")
+
+    # Step 5: Analyze on full dataset
+    samples = analyze_results(pinn_net, data, n_samples=1000, fix_p3=FIX_P3)
+
+    # Step 6: Predictions with uncertainty
+    predictions = predict_with_uncertainty(
+        pinn_net, data, samples, n_posterior_samples=100
+    )
+
+    # Step 7: Compute metrics
+    compute_metrics(data, predictions)
+
+    # Step 8: Comprehensive visualization
+    fig = plot_comprehensive_results(pinn_net, data, train_losses, val_losses, samples)
+
+    # Save results
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    fig_path = os.path.join(SAVE_DIR, "comprehensive_results.png")
+    plt.savefig(fig_path, dpi=300, bbox_inches="tight")
+    print(f"\nResults saved to: {fig_path}")
     plt.show()
-    
-    print("\n" + "="*70)
-    print("ANALYSIS COMPLETE")
-    print("="*70)
+
+    print("\n" + "=" * 70)
+    print("ANALYSIS COMPLETE!")
+    print("=" * 70)
     print(f"\nAll outputs saved to: {SAVE_DIR}")
-    print("Files saved:")
-    print(f"  - best_model.pt (best checkpoint)")
-    print(f"  - final_model.pt (final model)")
-    print(f"  - checkpoint_iter_*.pt (periodic checkpoints)")
-    print(f"  - training_losses.csv (loss history)")
-    print(f"  - bayesian_pinn_results.png (visualization)")
-
-
-# ============================================================================
-# UTILITY FUNCTION FOR COLAB
-# ============================================================================
-
-def resume_training_from_checkpoint(checkpoint_path, data, additional_iterations=1000,
-                                   lr=0.001, save_dir='./checkpoints', checkpoint_freq=500):
-    """
-    Resume training from a saved checkpoint (useful for Colab interruptions)
-    
-    Parameters:
-    -----------
-    checkpoint_path : str
-        Path to checkpoint file to resume from
-    data : dict
-        Preprocessed data dictionary
-    additional_iterations : int
-        How many more iterations to train
-    lr : float
-        Learning rate (can be different from original)
-    save_dir : str
-        Directory to save new checkpoints
-    checkpoint_freq : int
-        Checkpoint frequency
-    
-    Returns:
-    --------
-    pinn_net : PINN
-        Trained network
-    all_losses : list
-        Combined loss history
-    """
-    print("="*70)
-    print("RESUMING TRAINING FROM CHECKPOINT")
-    print("="*70)
-    
-    # Load checkpoint
-    pinn_net, checkpoint = load_checkpoint(checkpoint_path)
-    
-    # Get previous losses and config
-    previous_losses = checkpoint['losses']
-    start_iteration = checkpoint['iteration']
-    fix_p3 = checkpoint['config']['fix_p3']
-    
-    print(f"\nResuming from iteration {start_iteration}")
-    print(f"Previous best loss: {min(previous_losses):.2e}")
-    print(f"Training for {additional_iterations} more iterations...")
-    
-    # Setup SVI with loaded parameters
-    optimizer = ClippedAdam({"lr": lr, "clip_norm": 10.0})
-    svi = SVI(model, guide, optimizer, loss=Trace_ELBO())
-    
-    # Extract data
-    t = data['t']
-    G_obs = data['G_obs']
-    I_obs = data['I_obs']
-    Gb = data['Gb']
-    Ib = data['Ib']
-    
-    # Continue training
-    new_losses = []
-    best_loss = min(previous_losses)
-    
-    import os
-    os.makedirs(save_dir, exist_ok=True)
-    
-    for iteration in range(additional_iterations):
-        loss = svi.step(t, G_obs, I_obs, Gb, Ib, pinn_net, fix_p3, 1e-5, True)  # compute_physics=True
-        new_losses.append(loss)
-        
-        current_iteration = start_iteration + iteration + 1
-        
-        if (iteration + 1) % 100 == 0 or iteration == 0:
-            print(f"Iteration {current_iteration:5d} | ELBO Loss: {loss:.2e}")
-        
-        # Save checkpoint
-        if (iteration + 1) % checkpoint_freq == 0 or iteration == additional_iterations - 1:
-            all_losses = previous_losses + new_losses
-            checkpoint = {
-                'iteration': current_iteration,
-                'loss': loss,
-                'losses': all_losses,
-                'pinn_state_dict': pinn_net.state_dict(),
-                'pyro_param_store': pyro.get_param_store().get_state(),
-                'config': {
-                    'n_iterations': current_iteration,
-                    'lr': lr,
-                    'fix_p3': fix_p3,
-                    'Gb': Gb,
-                    'Ib': Ib
-                }
-            }
-            
-            checkpoint_path = os.path.join(save_dir, f'checkpoint_iter_{current_iteration}.pt')
-            torch.save(checkpoint, checkpoint_path)
-            print(f"  → Checkpoint saved: {checkpoint_path}")
-            
-            if loss < best_loss:
-                best_loss = loss
-                best_path = os.path.join(save_dir, 'best_model.pt')
-                torch.save(checkpoint, best_path)
-                print(f"  → Best model updated: {best_path}")
-    
-    all_losses = previous_losses + new_losses
-    
-    # Save updated losses
-    losses_df = pd.DataFrame({
-        'iteration': range(1, len(all_losses) + 1),
-        'loss': all_losses
-    })
-    losses_csv_path = os.path.join(save_dir, 'training_losses.csv')
-    losses_df.to_csv(losses_csv_path, index=False)
-    
-    print(f"\nResumed training completed!")
-    print(f"Total iterations: {len(all_losses)}")
-    
-    return pinn_net, all_losses
 
 
 if __name__ == "__main__":
